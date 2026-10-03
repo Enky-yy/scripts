@@ -1,0 +1,141 @@
+#!/bin/bash
+
+# ── Hardcoded credentials ────────────────────────────────────────
+USERNAME="24155057"
+PASSWORD="jd123456"
+
+# ── Config ───────────────────────────────────────────────────────
+INSTALL_PATH="/etc/NetworkManager/dispatcher.d/99-fortiauth"
+PORTAL_IP="192.168.249.1:1000"
+TEST_URL="http://detectportal.firefox.com/canonical.html"
+
+# ── Determine run context ────────────────────────────────────────
+# NetworkManager passes: $1=interface $2=action
+# Direct user invocation: no args
+NM_ACTION="${2:-direct}"
+
+# ── Self-install (only when run directly and not yet installed) ──
+if [[ "$NM_ACTION" == "direct" && "$(realpath "$0")" != "$INSTALL_PATH" ]]; then
+    echo "[*] Installing FortiAuth dispatcher hook..."
+    sudo cp "$(realpath "$0")" "$INSTALL_PATH"
+    sudo chmod 755 "$INSTALL_PATH"
+    echo "[+] Installed to $INSTALL_PATH"
+    echo "[*] Will run automatically on every network connect."
+    echo "[*] Running authentication now..."
+    # Fall through to auth below
+    NM_ACTION="up"
+fi
+
+# ── Only proceed on network-up or captive-portal events ──────────
+# NM fires "connectivity-change" when it detects a captive portal,
+# which is the event that actually matters here — not just "up".
+[[ "$NM_ACTION" == "up" || "$NM_ACTION" == "connectivity-change" ]] || exit 0
+
+# ── Step 1: Detect captive portal ────────────────────────────────
+echo "[*] Checking for captive portal..."
+
+PAGE_BODY=$(curl -s \
+    --max-redirs 10 \
+    --connect-timeout 5 \
+    --max-time 8 \
+    "$TEST_URL" 2>/dev/null) || {
+    echo "[-] Network unreachable"
+    exit 1
+}
+
+MAGIC_URL=$(echo "$PAGE_BODY" | grep -oE 'http://[^"'\'' <>]+fgtauth\?[^"'\'' <>]+' | head -1)
+
+# ── Step 2: Fallback - probe portal IP directly ──────────────────
+if [[ -z "$MAGIC_URL" ]]; then
+    echo "[*] No redirect detected — probing portal IP directly..."
+    PORTAL_BODY=$(curl -s \
+        --max-redirs 5 \
+        --connect-timeout 5 \
+        --max-time 8 \
+        "http://$PORTAL_IP/" 2>/dev/null) || true
+
+    MAGIC_URL=$(echo "$PORTAL_BODY" | grep -oE 'http://[^"'\'' <>]+fgtauth\?[^"'\'' <>]+' | head -1)
+fi
+
+if [[ -z "$MAGIC_URL" ]]; then
+    echo "[+] No portal detected — already authenticated."
+    exit 0
+fi
+
+echo "[*] Portal URL: $MAGIC_URL"
+
+# ── Step 3: Extract magic token ──────────────────────────────────
+MAGIC_TOKEN=$(echo "$MAGIC_URL" | sed -E 's/.*\?//')
+
+if [[ -z "$MAGIC_TOKEN" ]]; then
+    echo "[-] Could not extract magic token from: $MAGIC_URL"
+    exit 1
+fi
+
+echo "[*] Magic token: $MAGIC_TOKEN"
+
+# ── Step 4: Initialize session with portal ────────────────────────
+echo "[*] Initializing session..."
+curl -s \
+    --max-redirs 0 \
+    --connect-timeout 5 \
+    --max-time 8 \
+    "$MAGIC_URL" > /dev/null 2>&1 || true
+
+sleep 1
+
+# ── Step 5: POST credentials ──────────────────────────────────────
+echo "[*] Sending credentials..."
+
+# URL-encode using printf + python3 to safely handle special characters
+url_encode() {
+    python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+}
+
+ENCODED_REDIR=$(url_encode "$TEST_URL")
+ENCODED_USER=$(url_encode "$USERNAME")
+ENCODED_PASS=$(url_encode "$PASSWORD")
+
+POST_BODY="4Tredir=${ENCODED_REDIR}&magic=${MAGIC_TOKEN}&username=${ENCODED_USER}&password=${ENCODED_PASS}"
+
+curl -s \
+    --max-redirs 5 \
+    --connect-timeout 5 \
+    --max-time 10 \
+    -X POST "http://$PORTAL_IP/" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -H "Origin: http://$PORTAL_IP" \
+    -H "Referer: $MAGIC_URL" \
+    -d "$POST_BODY" > /dev/null 2>&1 || true
+# FortiGate drops the connection after auth — curl non-zero exit is expected
+
+# ── Step 6: Verify with retry ────────────────────────────────────
+echo "[*] Verifying authentication..."
+
+AUTHENTICATED=false
+for attempt in 1 2 3; do
+    sleep 2
+    CHECK_BODY=$(curl -s \
+        --max-redirs 10 \
+        --connect-timeout 5 \
+        --max-time 8 \
+        "$TEST_URL" 2>/dev/null) || continue
+
+    STILL_PORTAL=$(echo "$CHECK_BODY" | grep -oE 'http://[^"'\'' <>]+fgtauth\?[^"'\'' <>]+' | head -1)
+
+    if [[ -z "$STILL_PORTAL" ]]; then
+        AUTHENTICATED=true
+        break
+    fi
+
+    echo "[*] Attempt $attempt: still on portal, retrying..."
+done
+
+if $AUTHENTICATED; then
+    echo "[+] Authenticated successfully!"
+else
+    echo "[-] Still hitting portal after 3 attempts."
+    echo "    Check that USERNAME/PASSWORD are correct in the script."
+    exit 1
+fi
+
